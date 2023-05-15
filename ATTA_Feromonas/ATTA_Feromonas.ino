@@ -128,13 +128,14 @@ TwoWire segundoI2C(&sercom1, 11, 13);
 //VARIABLES GLOBALES
 
 //Variables para la máquina de estados principal
-enum PosiblesEstados {AVANCE=0, RETROCEDA, GIRE_DERECHA, GIRE_IZQUIERDA, ESCOGER_DIRECCION, GIRO, CONTROL_POSE, MEDICION_MAG, NADA};
+enum PosiblesEstados {AVANCE=0, RETROCEDA, GIRE_DERECHA, GIRE_IZQUIERDA, ESCOGER_DIRECCION, GIRO, CONTROL_POSE, MEDICION_MAG, MAPEO, NADA};
 //char const *PosEstados[] = {"AVANCE", "RETROCEDA", "GIRE_DERECHA", "GIRE_IZQUIERDA","ESCOGER_DIRECCION","GIRO", "NADA"};
-PosiblesEstados estado = AVANCE;
+PosiblesEstados estado = MAPEO;
 
 bool banderaParar = false; // Detiene todo avance del robot
 
-
+enum PosiblesStep {AVANZAR=0, GIRODERECHA1, GIROIZQUIERDA, GIRODERECHA2};
+PosiblesStep step = AVANZAR;
 //variable que almacena el tiempo del último ciclo de muestreo
 unsigned long tiempoActual = 0;
 unsigned long tiempoMaquinaEstados = 0;
@@ -375,7 +376,8 @@ unsigned long loopStartTime = 0;    // Variable to store the start time of the l
 unsigned long loopTimeSum = 0;      // Variable to store the sum of the loop times
 unsigned int loopCount = 0;         // Variable to store the number of loops executed
 
-
+int distancia_avance = 50;
+int distancia_recorrida = 0;
 void setup() {
   //asignación de pines
   microsPrevious = micros();
@@ -732,6 +734,32 @@ void loop(){
         
         break;
       }
+
+      case MAPEO: {
+        Escanear(1000, 50, 5);
+
+        bool EscaneoTerminado = Escanear(1000, 40, 20);; 
+      //bool avanceTerminado= true;
+      if (EscaneoTerminado){
+        ConfiguracionParar(); 
+        estado = NADA;
+      }
+        else if (feromona){
+          Serial.println("FEROMONA ENCONTRADA");
+          ConfiguracionParar(); 
+          if(estado!=RETROCEDA && giroTerminado==1 && tiempoActual>2000){
+            //Solo si el estado ya no es retroceder.  También que no está haciendo un giro 
+            //y para que ignore las interrupciones los primeros segundos al encenderlo
+            estado=RETROCEDA;
+            ConfiguracionParar(); //Se detiene un momento y reset de encoders 
+            tiempoRetroceso= tiempoActual; //Almacena el ultimo tiempo para usarlo en el temporizador
+              }
+          feromona = false;}
+        
+        break;
+      }
+
+
       case NADA: {
         
         break;
@@ -741,6 +769,69 @@ void loop(){
 }
 
 
+bool Escanear(int distanciaTotal, int paso, int angulo) {
+  bool finMovimiento = false; 
+  switch (step){
+    case AVANZAR: {
+      bool avanceTerminado = AvanzarDistancia(paso); 
+      //bool avanceTerminado= true;
+      if (avanceTerminado){
+        ConfiguracionParar(); 
+        distancia_recorrida += paso;
+        tiempoGiro = millis();
+        step = GIRODERECHA1;         
+        if (distancia_recorrida >= distanciaTotal){
+          finMovimiento = true;
+          return finMovimiento;
+        }
+
+        }        
+      break;     
+    }
+    case GIRODERECHA1:{
+      giroTerminado= Giro(angulo);
+      if ((millis() - tiempoGiro) > limiteGiro){ //Si pasa mas del limite de tiempo tratando de girar se detiene y lo trata como si hubiera completado el giro, evita que se quede intentando girar si está bloqueado
+          giroTerminado = true;
+        }
+      if   (giroTerminado) {
+        ConfiguracionParar(); //detiene el carro un momento
+        tiempoGiro = millis();
+        step = GIROIZQUIERDA;
+      }
+      
+      break;
+    }
+    case GIROIZQUIERDA:{
+      giroTerminado= Giro(-2*angulo);
+      if ((millis() - tiempoGiro) > limiteGiro){ //Si pasa mas del limite de tiempo tratando de girar se detiene y lo trata como si hubiera completado el giro, evita que se quede intentando girar si está bloqueado
+          giroTerminado = true;
+        }
+      if   (giroTerminado) {
+        ConfiguracionParar(); //detiene el carro un momento
+        tiempoGiro = millis();
+        step = GIRODERECHA2;
+      }
+
+      break;
+
+    }
+    case GIRODERECHA2:{
+      giroTerminado= Giro(angulo);
+      if ((millis() - tiempoGiro) > limiteGiro){ //Si pasa mas del limite de tiempo tratando de girar se detiene y lo trata como si hubiera completado el giro, evita que se quede intentando girar si está bloqueado
+          giroTerminado = true;
+        }
+      if   (giroTerminado) {
+        ConfiguracionParar(); //detiene el carro un momento
+        
+        step = AVANZAR;
+      }
+      break;
+    }
+
+
+  }
+  return finMovimiento;
+}
 
 void leerMsgSTM ()  {
   //Función llamada cuando se recibe algo en el puerto I2C conectado al STM32
