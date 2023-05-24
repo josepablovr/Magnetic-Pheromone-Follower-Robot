@@ -8,6 +8,8 @@
 #include <RH_RF69.h> //Biblioteca para la comunicacion por radio frecuencia
 #include <RHDatagram.h> // Biblioteca para la comunicación con direcciones
 #include <Coordinates.h>
+#include <math.h>
+
 /************ Serial Setup ***************/
 #define debug 1
 
@@ -93,15 +95,26 @@ const float velBase=120.0; //unidades mm/s
 
 
 //constantes para control PID del recorrido de arco
-const float KpArco=0.01; //constante control derivativo
-const float KdArco=0.00000; //constante control derivativo
-const float KiArco=0.002; //constante control derivativo
-const float velmax_arco=1; //velocidad angular máxima en rad/s
-const float velmin_arco = 0.2; //velocidad angular mínima en rad/s
+//distancias cortas
+const float KpArco1=0.05; //constante control derivativo
+const float KdArco1=0.00000; //constante control derivativo
+const float KiArco1=0.01; //constante control derivativo
+
+
+//distancias grandes
+const float KpArco2=0.005; //constante control derivativo
+const float KdArco2=0.00000; //constante control derivativo
+const float KiArco2=0.001; //constante control derivativo
+
+
+const float velmax_arco=0.35; //velocidad angular máxima en rad/s
+const float velmin_arco = 0.17; //velocidad angular mínima en rad/s
 int pasoArco = 1; //Paso para la secuencia del arco
-int radioArco = 300; // Radio (mm) del arco que describirá el robot
-int gradosArco = 180; // Ángulo (grados) del arco que describirá el 
+int radioArco = 80; // Radio (mm) del arco que describirá el robot
+int gradosArco = 15; // Ángulo (grados) del arco que describirá el 
 float distanciaEntreRuedas = 63.75; // Distancia (mm) aproximada de separación entre las ruedas
+int n_estable = 0; //Numero de estados estables
+int error_estable = 10; //Error permanente permitivo (mm)
 
 //Constantes para la implementación del control PID real
 const int errorMinIntegralVelocidad=-255;
@@ -168,8 +181,12 @@ PosiblesEstados estado = MAPEO;
 
 bool banderaParar = false; // Detiene todo avance del robot
 
-enum PosiblesStep {AVANZAR=0, GIRODERECHA1, GIROIZQUIERDA1, GIROIZQUIERDA2, GIRODERECHA2};
-PosiblesStep step = AVANZAR;
+enum PosiblesStep1 {INICIO=0, GIRO_ANTIHORARIO, GIRO_HORARIO, GIRO_HORARIO2, GIRO_ANTIHORARIO2};
+PosiblesStep1 estado_Barrido1 = INICIO;
+
+enum PosiblesStep2 {ARCO_INICIAL=0, ARCO_ANTIHORARIO, ARCO_HORARIO, ALINEAR};
+PosiblesStep2 estado_Barrido2 = ARCO_INICIAL;
+
 //variable que almacena el tiempo del último ciclo de muestreo
 unsigned long tiempoActual = 0;
 unsigned long tiempoMaquinaEstados = 0;
@@ -413,9 +430,12 @@ unsigned long loopStartTime = 0;    // Variable to store the start time of the l
 unsigned long loopTimeSum = 0;      // Variable to store the sum of the loop times
 unsigned int loopCount = 0;         // Variable to store the number of loops executed
 
-int distancia_avance = 50;
+
+
+float distancia_lineal_recorrida = 0;
 
 int distancia_recorrida = 50;
+int giro_final = 0; //direccion del giro
 void setup() {
   //asignación de pines
   microsPrevious = micros();
@@ -775,7 +795,7 @@ void loop(){
 
       case MAPEO: {       
 
-        bool EscaneoTerminado = Escanear_Coord(2000, 80, 15);
+        bool EscaneoTerminado = Barrido_Arco(300, 130, 20);
       //bool avanceTerminado= true;
       if (EscaneoTerminado){
         ConfiguracionParar(); 
@@ -805,82 +825,91 @@ void loop(){
   }
 }
 
+/// @brief Funcion que permite al Atta realizar un barrido moviendose hacia una direccion y realizando giros cada cierta distancia
+/// @param distanciaTotal Distancia lineal Deseada (mm)
+/// @param paso distancia lineal entre giros (mm) 
+/// @param angulo Desplazamiento angular deseado (°) (desde el centro hasta el extremo)
+/// @return true cuando se completa el movimiento y false cuando se esta ejecutando el movimiento
+bool Barrido_Lineal_Giros(int distanciaTotal, int paso, int angulo) {
+  bool finMovimiento = false; //variable para indicar el final del recorrido
 
-bool Escanear(int distanciaTotal, int paso, int angulo) {
-  bool finMovimiento = false; 
   KpVel = KpVel_fer; //constante control proporcional
   KiVel = KiVel_fer; //constante control integral
   KdVel = KdVel_fer; //constante control derivativo
+
   KpGiro = KpGiro_fer; //constante control proporcional
   KiGiro = KiGiro_fer; //constante control integral
   KdGiro = KdGiro_fer; //constante control derivativo
-  switch (step){
-    case AVANZAR: {
-      bool avanceTerminado = AvanzarDistancia(paso); 
-      //bool avanceTerminado= true;
-      if (avanceTerminado){
-        ConfiguracionParar(); 
-        distancia_recorrida += paso;
-        tiempoGiro = millis();
-        step = GIRODERECHA1;         
-        if (distancia_recorrida >= distanciaTotal){
-          finMovimiento = true;
+
+  switch (estado_Barrido1){ //Maquina de estados
+
+    case INICIO: {
+      bool avanceTerminado = AvanzarDistancia(paso); //Se avanza en línea recta
+      
+      if (avanceTerminado){ //Se verifica que se haya terminado el recorrido
+        ConfiguracionParar(); //Se detiene el robot
+        distancia_recorrida += paso; //Se toma en cuenta la distancia recorrida        
+               
+        if (distancia_recorrida >= distanciaTotal){ //Se verifica si se ha terminado el recorrido
+          finMovimiento = true; //Se indica el final del recorrido
           return finMovimiento;
         }
 
-        }        
+        }
+        estado_Barrido1 = GIRO_ANTIHORARIO; //Se pasa al siguiente estado
+        tiempoGiro = millis();         
       break;     
     }
-    case GIRODERECHA1:{
-      giroTerminado= Giro(angulo);
+    case GIRO_ANTIHORARIO:{
+      giroTerminado= Giro(angulo); //Se realiza el grio antihorario
       if ((millis() - tiempoGiro) > limiteGiro){ //Si pasa mas del limite de tiempo tratando de girar se detiene y lo trata como si hubiera completado el giro, evita que se quede intentando girar si está bloqueado
           giroTerminado = true;
         }
       if   (giroTerminado) {
         ConfiguracionParar(); //detiene el carro un momento
         tiempoGiro = millis();
-        step = GIROIZQUIERDA1;
+        estado_Barrido1 = GIRO_HORARIO; //se pasa al siguienter estado
       }
       
       break;
     }
-    case GIROIZQUIERDA1:{
-      giroTerminado= Giro(-angulo);
+    case GIRO_HORARIO:{
+      giroTerminado= Giro(-angulo); //Se realiza el hiro horario
       if ((millis() - tiempoGiro) > limiteGiro){ //Si pasa mas del limite de tiempo tratando de girar se detiene y lo trata como si hubiera completado el giro, evita que se quede intentando girar si está bloqueado
           giroTerminado = true;
         }
       if   (giroTerminado) {
         ConfiguracionParar(); //detiene el carro un momento
         tiempoGiro = millis();
-        step = GIROIZQUIERDA2;
+        estado_Barrido1 = GIRO_HORARIO2; //Se passa al siguiente estado
       }
 
       break;
 
     }
-    case GIROIZQUIERDA2:{
-      giroTerminado= Giro(-angulo);
+    case GIRO_HORARIO2:{
+      giroTerminado= Giro(-angulo); //Se realiza el hiro horario
       if ((millis() - tiempoGiro) > limiteGiro){ //Si pasa mas del limite de tiempo tratando de girar se detiene y lo trata como si hubiera completado el giro, evita que se quede intentando girar si está bloqueado
           giroTerminado = true;
         }
       if   (giroTerminado) {
         ConfiguracionParar(); //detiene el carro un momento
         tiempoGiro = millis();
-        step = GIRODERECHA2;
+        estado_Barrido1 = GIRO_ANTIHORARIO2; //Se pasa al siguiente estado
       }
 
       break;
 
     }
-    case GIRODERECHA2:{
-      giroTerminado= Giro(angulo);
+    case GIRO_ANTIHORARIO2:{
+      giroTerminado= Giro(angulo); //Se realiza el giro antihorario
       if ((millis() - tiempoGiro) > limiteGiro){ //Si pasa mas del limite de tiempo tratando de girar se detiene y lo trata como si hubiera completado el giro, evita que se quede intentando girar si está bloqueado
           giroTerminado = true;
         }
       if   (giroTerminado) {
         ConfiguracionParar(); //detiene el carro un momento
         
-        step = AVANZAR;
+        estado_Barrido1 = INICIO; //Se pasa al estado inicial
       }
       break;
     }
@@ -892,82 +921,125 @@ bool Escanear(int distanciaTotal, int paso, int angulo) {
 
 
 
-
-bool Escanear_Coord(int distanciaTotal, int paso, int angulo) {
-    bool finMovimiento = false; 
-    KpVel = KpVel_Og; //constante control proporcional
-    KiVel = KiVel_Og; //constante control integral
-    KdVel = KdVel_Og; //constante control derivativo
-    KpGiro = KpGiro_Og; //constante control proporcional
-    KiGiro = KiGiro_Og; //constante control integral
-    KdGiro = KdGiro_Og; //constante control derivativo 
-   
+/// @brief Funcion que permite al Atta realizar un barrido moviendose hacia una direccion mediante arcos
+/// @param distanciaTotal Distancia lineal Deseada (mm)
+/// @param radio Radio de los arcos (mm)
+/// @param angulo Desplazamiento angular deseado (°) (desde el centro hasta el extremo)
+/// @return true cuando se completa el movimiento y false cuando se esta ejecutando el movimiento
+bool Barrido_Arco(float distanciaTotal, int radio, int angulo) {
+    bool finMovimiento = false; //variable para saber cuando finaliza   
+    
+    float distancia_arco = radio*sin(angulo*PI/180); //distancia lineal recorrida al hacer un arco simple
+    float distancia_arco2 = radio*sin(2*angulo*PI/180); //distancia lineal recorrida al hacer un arco doble  
+    
       
-    switch (step){
-        case AVANZAR:{
+    switch (estado_Barrido2){ //Maquina de estados
 
-            //distancia_recorrida = paso; 
-            bool avanceTerminado = HacerArco(paso, angulo);  
-            //bool retrocesoTerminado= AvanzarDistancia(unidadRetroceso);    
-            if   (avanceTerminado) {
+        case ARCO_INICIAL:{ //arco simple inicial
+
+            
+            bool avanceTerminado = HacerArco(radio, angulo);  //se realiza el arco
+             
+            if   (avanceTerminado) { //se verifica que haya terminado
                  
                 ConfiguracionParar(); //detiene el carro un momento
-                    
-                step = GIROIZQUIERDA1;}
-            
-        
+                
+                giro_final = -1; //se determina que se debe hacer el arco en sentido horario en caso de que se vaya a terminar
+                distancia_lineal_recorrida += distancia_arco; //se toma en cuenta el desplazamiento lineal
+                estado_Barrido2 = ARCO_HORARIO;} //se pasa al siguiente estado  
         break;
         }
-        case GIROIZQUIERDA1:{
-            //bool avanceTerminado = AvanzarCoordenada(angulo, distancia_recorrida, 40);  
-            bool avanceTerminado = HacerArco(paso, -2*angulo);  
-            //bool retrocesoTerminado= AvanzarDistancia(unidadRetroceso);    
-            if   (avanceTerminado) {
-                 
+        case ARCO_HORARIO:{             
+
+            bool avanceTerminado = HacerArco(radio, -2*angulo); //Se realiza un arco doble en sentido horario    
+
+            if   (avanceTerminado) {      //se verifica que haya terminado           
                 ConfiguracionParar(); //detiene el carro un momento
-                    
-                step = GIRODERECHA1;
+                distancia_lineal_recorrida += distancia_arco2; //se toma en cuenta el desplazamiento lineal
+                giro_final = 1;  //se determina que se debe hacer el arco en sentido antihorario en caso de que se vaya a terminar
+                estado_Barrido2 = ARCO_ANTIHORARIO; //se pasa al siguiente estado 
                 
         }
             
         break;
 
         }
-        case GIRODERECHA1:{
-            //bool avanceTerminado = AvanzarCoordenada(angulo, -distancia_recorrida, 70);   
-            bool avanceTerminado = HacerArco(paso, 2*angulo);  
-            //finMovimiento = true;
+        case ARCO_ANTIHORARIO:{
+             
+            bool avanceTerminado = HacerArco(radio, 2*angulo);              
             
-            if   (avanceTerminado) {
-                //distancia_recorrida += 2*paso;  
+            if   (avanceTerminado) {//se verifica que haya terminado                 
                 ConfiguracionParar(); //detiene el carro un momento
-                step = GIROIZQUIERDA1;
+                giro_final = -1;  //se determina que se debe hacer el arco en sentido horario en caso de que se vaya a terminar
+                distancia_lineal_recorrida += distancia_arco2; //se toma en cuenta el desplazamiento lineal
+                estado_Barrido2 = ARCO_HORARIO; //se pasa al siguiente estado
             }
-
+                
             
             break;
             }
-        
+        case ALINEAR:{
+            
+            bool avanceTerminado; 
+            if (giro_final == 1){ //El arco final debe ser antihorario
+              avanceTerminado = HacerArco(radio, angulo);  
+            }
+            else { //EL arco final debe ser horario
+              avanceTerminado = HacerArco(radio, -angulo); 
+            }
+            if   (avanceTerminado) { //se verifica que haya terminado                
+                finMovimiento = true; //Se indica la finalizacion del recorrido
+                distancia_lineal_recorrida = 0; //Se reinicia la variable de recorrido
+                return finMovimiento;
+            }          
+            break;
+            }       
         }
+  
+  if (distancia_lineal_recorrida >= distanciaTotal){ //Se verifica si se está a punto de terminar el recorrido
+    estado_Barrido2 = ALINEAR; //Se cambia al estado final para alinear el robot
+  }
   return finMovimiento;
 }
 
-bool HacerArco(int radio, int angulo) {    // La idea es agregar los parámetros "radio" y "angulo" más adelante
-  // El robot describe un movimiento circular haciendo un arco de radio "radio" en mm y ángulo "angulo" en grados
-  // Devuelve true cuando describió el arco deseado
- float sentido_giro = 1;
-  if (angulo < 0){
-    sentido_giro = -1;
-    angulo = -angulo;
+/// @brief Funcion que permite al Atta realizar un arco
+/// @param radio Radio del arco (mm)
+/// @param angulo Desplazamiento angular deseado (°)
+/// @return true cuando se completa el movimiento y false cuando se esta ejecutando el movimiento
+bool HacerArco(int radio, int angulo) {  
+ 
+
+  float sentido_giro = 1; //Sentido de giro, positivo antihorario
+  if (angulo < 0){  //Se verifica la direccion del arco
+    sentido_giro = -1; //Negativo para movimiento horario    
   }
   
-
-  float distanciaDeseada = sentido_giro*PI*(float)angulo*(float)radio/180.0;         // angulo*(pi/180°)*R es la longitud de arco que recorrerá el robot 
-  float distanciaAvanzada = calculaDistanciaCircularRecorrida(sentido_giro);
-  float PorcentajeRecorrido = distanciaAvanzada/distanciaDeseada;
+   
+  float distanciaDeseada = PI*(float)angulo*(float)radio/180.0;  //Desplazamiento total del robot
+  float distanciaAvanzada = calculaDistanciaCircularRecorrida(sentido_giro); //Desplazamieto actual del robot
   
-  velActualDerecha= calculaVelocidadRueda(contPulsosDerecha, contPulsosDerPasado);
-  velActualIzquierda= -1.0 *calculaVelocidadRueda(contPulsosIzquierda, contPulsosIzqPasado); //como las ruedas
+
+  float KpArco; //Constante control proporcional
+  float KdArco; //Constante control derivativa
+  float KiArco; //Contante control integral
+
+  //Se definen las constantes de control para distancias pequeñas
+  if ((abs(distanciaDeseada) - abs(distanciaAvanzada)) <= 50){
+    KpArco=KpArco1;
+    KdArco=KdArco1; 
+    KiArco=KiArco1; 
+  }
+  //Se definen las constantes de control para distancias largas
+  else{
+    KpArco=KpArco2;
+    KdArco=KdArco2; 
+    KiArco=KiArco2; 
+  }
+
+
+
+  velActualDerecha= calculaVelocidadRueda(contPulsosDerecha, contPulsosDerPasado); //Velocidad tangencial derecha
+  velActualIzquierda= -1.0 *calculaVelocidadRueda(contPulsosIzquierda, contPulsosIzqPasado); //Velocidad tangencial izquierda
  
   
   //Errores
@@ -1000,52 +1072,45 @@ bool HacerArco(int radio, int angulo) {    // La idea es agregar los parámetros
   }
   else if (velocidadAngular < -velmax_arco){
     velocidadAngular = -velmax_arco;
-  }
-//  else if (PorcentajeRecorrido < 0.7) {
-//    velocidadAngular = velmax_arco;
-//  }
-
-  
+  } 
 
   float velSetPointDerecha = sentido_giro*velocidadAngular*((float)radio+sentido_giro*distanciaEntreRuedas);     // Velocidad tangencial del extremo derecho del robot     
   float velSetPointIzquierda = sentido_giro*velocidadAngular*((float)radio-sentido_giro*distanciaEntreRuedas);   // Velocidad tangencial del extremo izquierdo 
   
   
-  
-  float nuevaVelocidadRuedaDerecha = velSetPointDerecha;
-  float nuevaVelocidadRuedaIzquierda = velSetPointIzquierda; 
-  //int cicloTrabajoRuedaDerecha = ControlVelocidadRueda(nuevaVelocidadRuedaDerecha, velActualDerecha, sumErrorVelDer, errorAnteriorVelDer);
-  //int cicloTrabajoRuedaIzquierda = ControlVelocidadRueda(nuevaVelocidadRuedaIzquierda, velActualIzquierda, sumErrorVelIzq, errorAnteriorVelIzq);
-  
-  nuevaVelocidadRuedaDerecha = constrain( (int)nuevaVelocidadRuedaDerecha, limiteInferiorCicloTrabajoVelocidad, limiteSuperiorCicloTrabajoVelocidad);
-  nuevaVelocidadRuedaIzquierda = constrain( (int)nuevaVelocidadRuedaIzquierda, limiteInferiorCicloTrabajoVelocidad, limiteSuperiorCicloTrabajoVelocidad);
-  //ConfiguraEscribePuenteH (cicloTrabajoRuedaDerecha, cicloTrabajoRuedaIzquierda);
-  ConfiguraEscribePuenteH (nuevaVelocidadRuedaDerecha, nuevaVelocidadRuedaIzquierda);
-  //Control PID
+  velSetPointDerecha = constrain( (int)velSetPointDerecha, limiteInferiorCicloTrabajoVelocidad, limiteSuperiorCicloTrabajoVelocidad); //Se verifican los límites
+  velSetPointIzquierda = constrain( (int)velSetPointIzquierda, limiteInferiorCicloTrabajoVelocidad, limiteSuperiorCicloTrabajoVelocidad); //Se verifican los límites
 
+  ConfiguraEscribePuenteH (velSetPointDerecha, velSetPointIzquierda);   //Se ejecuta el movimiento en las ruedas
+
+
+  
+  errorAnteriorOrientacion = errorArco; //Memoria del error
+
+  bool avanceListo = false;  //Movimiento sin terminar
+
+  //Se verifica el estado estable tomando en cuenta un error
+  if (abs(distanciaAvanzada) >= (abs(distanciaDeseada)-error_estable) && abs(distanciaAvanzada) <= (abs(distanciaDeseada)+error_estable)) { 
+    n_estable += 1; //Se añade un ciclo de estabilidad
+    if (n_estable >= 20) { //Se verifica que se cumpla con 20 ciclos de estabilidad
+      sumErrorVelDer=0;
+      errorAnteriorVelDer=0;
+      sumErrorVelIzq=0;
+      errorAnteriorVelIzq=0;
+      errorAnteriorOrientacion = 0;     
+      distanciaAvanzada = 0;
+      velocidadAngular = 0;
+      avanceListo = true; //Movimiento terminado
+
+    }
+    
     
    
-  
-
-
-  
-  errorAnteriorOrientacion = errorArco;
-  bool avanceListo = false; 
-  if (abs(distanciaAvanzada) >= abs(distanciaDeseada)) {
-    sumErrorVelDer=0;
-    errorAnteriorVelDer=0;
-    sumErrorVelIzq=0;
-    errorAnteriorVelIzq=0;
-    errorAnteriorOrientacion = 0;
-    avanceListo = true; 
-    distanciaAvanzada = 0;
-    velocidadAngular = 0;
-    
-    //ResetContadoresEncoders();
   }
 
   return avanceListo;
 }
+
 
 bool posicionarArco(int Xcentro, int Ycentro) {
   bool posicionLista = false;
