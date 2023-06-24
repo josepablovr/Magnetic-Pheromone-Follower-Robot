@@ -96,25 +96,25 @@ const float velBase=120.0; //unidades mm/s
 
 //constantes para control PID del recorrido de arco
 //distancias cortas
-const float KpArco1=0.05; //constante control derivativo
-const float KdArco1=0.00000; //constante control derivativo
+const float KpArco1=0.01; //constante control derivativo
+const float KdArco1=0.001; //constante control derivativo
 const float KiArco1=0.01; //constante control derivativo
 
 
 //distancias grandes
 const float KpArco2=0.005; //constante control derivativo
-const float KdArco2=0.00000; //constante control derivativo
+const float KdArco2=0.001; //constante control derivativo
 const float KiArco2=0.001; //constante control derivativo
 
 
-const float velmax_arco=0.35; //velocidad angular máxima en rad/s
-const float velmin_arco = 0.17; //velocidad angular mínima en rad/s
+const float velmax_arco=0.4; //velocidad angular máxima en rad/s
+const float velmin_arco = 0.2; //velocidad angular mínima en rad/s
 int pasoArco = 1; //Paso para la secuencia del arco
 int radioArco = 80; // Radio (mm) del arco que describirá el robot
 int gradosArco = 15; // Ángulo (grados) del arco que describirá el 
 float distanciaEntreRuedas = 63.75; // Distancia (mm) aproximada de separación entre las ruedas
 int n_estable = 0; //Numero de estados estables
-int error_estable = 10; //Error permanente permitivo (mm)
+int error_estable = 20; //Error permanente permitivo (mm)
 
 //Constantes para la implementación del control PID real
 const int errorMinIntegralVelocidad=-255;
@@ -187,6 +187,9 @@ PosiblesStep1 estado_Barrido1 = INICIO;
 enum PosiblesStep2 {ARCO_INICIAL=0, ARCO_ANTIHORARIO, ARCO_HORARIO, ALINEAR};
 PosiblesStep2 estado_Barrido2 = ARCO_INICIAL;
 
+//Algoritmo de Seguimiento
+enum PosiblesEstados_Seguimiento {ESTABILIZACION=0, Barrido_Inicial, ARCO_Derecha, ARCO_Izquierda, FINAL};
+PosiblesEstados_Seguimiento estado_Seguimiento = ESTABILIZACION;
 //variable que almacena el tiempo del último ciclo de muestreo
 unsigned long tiempoActual = 0;
 unsigned long tiempoMaquinaEstados = 0;
@@ -321,6 +324,15 @@ bool cal_mpu=0;
 //VARIABLES FEROMONA
 #define Addr_MagFer 0x0C //I2C Address para el HMC5883
 
+#define MAG3110_ADDRESS 0x0E
+#define MAG3110_REGISTER_STATUS 0x00
+#define MAG3110_REGISTER_X_MSB 0x01
+#define MAG3110_REGISTER_X_LSB 0x02
+#define MAG3110_REGISTER_Y_MSB 0x03
+#define MAG3110_REGISTER_Y_LSB 0x04
+#define MAG3110_REGISTER_Z_MSB 0x05
+#define MAG3110_REGISTER_Z_LSB 0x06
+#define MAG3110_REGISTER_CTRL_REG1 0x10
 
 //Variables de salida
 float diffCompass = 0; //Diferencia de direcciones
@@ -330,7 +342,7 @@ float magnitud_Z = 0; //Magnitud en Z de HSC
 float angulo_QMC = 0, angulo_HSC = 0; //Angulos de las brújulas
 short qmc_x,qmc_y,qmc_z; //Coordenadas de QMC
 short hsc_x,hsc_y,hsc_z; //Coordenadas de QMC
-
+short mag_x,mag_y,mag_z; //Coordenadas de QMC
 
 #define dirEEPROM B01010000
 //VARIABLES CALIBRACION
@@ -364,10 +376,19 @@ bool calibracion = false; //Detección  del final de la calibración
 
 //VARIABLES FILTROS
 //Filtro paso banda de Eje Z
-float betaH = 0.6;
-float betaL = 0.9;
+
+float alpha1=0.167; 
+float alpha2=0.0055;
+
+//float alpha1=0.6; 
+//float alpha2=0.9;
+
 float HSC_Z_anteriorH = 0.0;
 float HSC_Z_anteriorL = 0.0;
+
+
+float MAG_Z_anteriorH = 0.0;
+float MAG_Z_anteriorL = 0.0;
 
 //Filtros paso bajo de orientaciones
 float betaPhi = 0.8;
@@ -426,10 +447,12 @@ int c = 0; //Contador para led 13
 int b = 0;
 
 bool feromona = false;
+bool deteccion_MAG = false;
+bool deteccion_HSC = false;
 unsigned long loopStartTime = 0;    // Variable to store the start time of the loop
 unsigned long loopTimeSum = 0;      // Variable to store the sum of the loop times
 unsigned int loopCount = 0;         // Variable to store the number of loops executed
-
+int contador_mediciones = 0;
 
 
 float distancia_lineal_recorrida = 0;
@@ -486,6 +509,7 @@ void setup() {
   //Inicializacion del Magnetómetro
   inicializaMagnet(); 
   Iniciar_HSCDTD008A();
+  Iniciar_MAG3110();
   resetVarGiro();
   
   //Inicializacion del MPU
@@ -583,12 +607,15 @@ void loop(){
   }
 
   unsigned long microsNow = micros();
-        if (microsNow > 0) { 
+        if (true) {  //Sin tiempo de muestreo definido
 
           Medicion_HSCDTD008A(hsc_x, hsc_y, hsc_z);
           medirMagnetQMC(qmc_x, qmc_y, qmc_z);
+          Leer_MAG3110(mag_x, mag_y, mag_z);
+
           float QMC_x = qmc_x, QMC_y = qmc_y;
           float HSC_x = hsc_x, HSC_y = hsc_y;
+
           angulo_QMC = CorrecionMedida(QMC_x, QMC_y, angElips_1,factorEsc_1, xoff1, yoff1, 1, 1);
           angulo_HSC = CorrecionMedida(HSC_x, HSC_y, angElips_2,factorEsc_2, xoff2, yoff2,-1 ,-1);
 
@@ -598,14 +625,10 @@ void loop(){
           float M1_y = (qmc_y - yoff1)*scale_y1;
           float M2_y = -(hsc_x - xoff2)*scale_x2;
           float M2_x = -(hsc_y - yoff2)*scale_y2;
-          float HSC_Z = hsc_z;
-
-          //Filtro pasa banda de eje Z en el sensor HSC
-          float HSC_Z_FPBH=  (betaH)*HSC_Z_anteriorH + (1- betaH)*HSC_Z;
-          float HSC_Z_FPBL=  (betaL)*HSC_Z_anteriorL + (1- betaL)*HSC_Z;
-          float HSC_Z_FPB= HSC_Z_FPBH - HSC_Z_FPBL;
-          HSC_Z_anteriorH= HSC_Z_FPBH;
-          HSC_Z_anteriorL= HSC_Z_FPBL;
+          float HSC_Z_Filtrado = Filtrado_Z(hsc_z, HSC_Z_anteriorH, HSC_Z_anteriorL);
+          float MAG_Z_Filtrado = Filtrado_Z(mag_z, MAG_Z_anteriorH, MAG_Z_anteriorL);
+          
+         
           
           //convierte XY de cartesiando a polar en QMC
           Coordinates puntoQMC = Coordinates();    
@@ -638,14 +661,28 @@ void loop(){
           unsigned long t = millis();
 
           String dataString = "";
-          dataString = String(t)+" "+String(angulo_QMC)+" "+String(angulo_HSC)+" "+String(qmc_z)+" "+String(HSC_Z_FPB);
-          Serial.println(dataString);
+          //dataString = String(t)+" "+String(angulo_QMC)+" "+String(angulo_HSC)+" "+String(qmc_z)+" "+String(HSC_Z_Filtrado);
+          dataString = String(t)+" "+String(HSC_Z_Filtrado)+" "+String(MAG_Z_Filtrado);
+          //Serial.println(dataString);
+          
           loopTimeSum += millis() - loopStartTime;  // Add the time taken to execute the loop to the sum
           loopCount++;                             // Increment the loop count
-
-          if (HSC_Z_FPB > 20) {
-            feromona = true;
+          if (contador_mediciones > 1000){
+            Serial.print("HSC: ");
+            Serial.print(HSC_Z_Filtrado);
+            
+            Serial.print(", MAG: ");
+            Serial.println(MAG_Z_Filtrado);
+            if (abs(HSC_Z_Filtrado) > 50){
+              deteccion_HSC = true;
+            }
+            if (abs(MAG_Z_Filtrado) > 50){
+              deteccion_MAG = true;
+            }}
+          else {
+            contador_mediciones++;
           }
+
 
 
 
@@ -795,29 +832,18 @@ void loop(){
 
       case MAPEO: {       
 
-        bool EscaneoTerminado = Barrido_Arco(300, 130, 20);
-      //bool avanceTerminado= true;
-      if (EscaneoTerminado){
-        ConfiguracionParar(); 
-        estado = NADA;
-      }
-        else if (feromona){
-          Serial.println("FEROMONA ENCONTRADA");
-          ConfiguracionParar(); 
-          if(estado!=RETROCEDA && giroTerminado==1 && tiempoActual>2000){
-            //Solo si el estado ya no es retroceder.  También que no está haciendo un giro 
-            //y para que ignore las interrupciones los primeros segundos al encenderlo
-            estado=RETROCEDA;
-            ConfiguracionParar(); //Se detiene un momento y reset de encoders 
-            tiempoRetroceso= tiempoActual; //Almacena el ultimo tiempo para usarlo en el temporizador
-              }
-          feromona = false;}
-        
+        bool finMovimiento = SeguirLinea(500, 100, 12);
+        if (finMovimiento){
+          ConfiguracionParar();
+          //estado = NADA;
+        }
+        //bool avanceTerminado= true;
         break;
       }
 
 
       case NADA: {
+        //ConfiguracionParar();
         
         break;
       }
@@ -1002,6 +1028,87 @@ bool Barrido_Arco(float distanciaTotal, int radio, int angulo) {
   return finMovimiento;
 }
 
+
+bool SeguirLinea(float distanciaTotal, int radio, int angulo)
+{
+  Serial.print("MAG: ");
+  Serial.println(deteccion_MAG);
+  Serial.print("  HSC: ");
+  Serial.println(deteccion_HSC);
+  bool finMovimiento = false;
+  switch (estado_Seguimiento){ //Maquina de estados
+        case ESTABILIZACION:{
+          if (contador_mediciones > 1000){
+            estado_Seguimiento = Barrido_Inicial;
+          }
+          break;
+        }
+
+        case Barrido_Inicial:{ //arco simple inicial
+
+            
+          bool avanceTerminado = Barrido_Arco(distanciaTotal, radio, angulo) ;  //se realiza el arco
+             
+          if   (deteccion_MAG) { //se verifica que haya terminado
+            ConfiguracionParar();
+            estado_Seguimiento = ARCO_Derecha; 
+            deteccion_MAG = false;
+            deteccion_HSC = false;
+
+                } //se pasa al siguiente estado  
+          else if (deteccion_HSC) { //se verifica que haya terminado
+            ConfiguracionParar();
+            estado_Seguimiento = ARCO_Izquierda; 
+            deteccion_HSC = false;   
+            deteccion_MAG = false;             
+             } //se pasa al siguiente estado  
+          else if (avanceTerminado)  { //se verifica que haya terminado
+            ConfiguracionParar();
+            estado_Seguimiento = FINAL;                
+            } //se pasa al siguien
+          break;
+        }
+        case ARCO_Derecha:{
+          bool avanceTerminado = HacerArco(radio, angulo); //Se realiza un arco doble en sentido horario    
+          if (deteccion_HSC) { //se verifica que haya terminado
+             ConfiguracionParar();
+             estado_Seguimiento = ARCO_Izquierda; 
+             deteccion_HSC = false;             
+             deteccion_MAG = false;   
+           } //se pasa al siguiente estado  
+
+          else if   (avanceTerminado) {      //se verifica que haya terminado           
+            ConfiguracionParar(); //detiene el carro un momento          
+            estado_Seguimiento = ARCO_Izquierda; 
+            //estado_Seguimiento = FINAL; //se pasa al siguiente estado 
+          }
+          break;
+        }
+        case ARCO_Izquierda:{
+          bool avanceTerminado = HacerArco(radio, -angulo);              
+          if   (deteccion_MAG) { //se verifica que haya terminado
+             estado_Seguimiento = ARCO_Derecha; 
+             deteccion_HSC = false;
+             deteccion_MAG = false; 
+                
+            } //se pasa al siguiente estado  
+
+          else if   (avanceTerminado) {//se verifica que haya terminado                 
+              ConfiguracionParar(); //detiene el carro un momento
+              estado_Seguimiento = ARCO_Derecha; 
+              //estado_Seguimiento = FINAL; //se pasa al siguiente estado 
+            }
+          break;
+        }
+        case FINAL:{
+          finMovimiento = true;
+          break;
+        }
+}
+  return finMovimiento;
+}
+
+
 /// @brief Funcion que permite al Atta realizar un arco
 /// @param radio Radio del arco (mm)
 /// @param angulo Desplazamiento angular deseado (°)
@@ -1024,7 +1131,7 @@ bool HacerArco(int radio, int angulo) {
   float KiArco; //Contante control integral
 
   //Se definen las constantes de control para distancias pequeñas
-  if ((abs(distanciaDeseada) - abs(distanciaAvanzada)) <= 50){
+  if ((abs(distanciaDeseada) - abs(distanciaAvanzada)) <= 70){
     KpArco=KpArco1;
     KdArco=KdArco1; 
     KiArco=KiArco1; 
@@ -1044,6 +1151,12 @@ bool HacerArco(int radio, int angulo) {
   
   //Errores
   float errorArco = distanciaDeseada - distanciaAvanzada;
+  if (errorArco > 40){
+    errorArco = 40;
+  } 
+  else if (errorArco < -40){
+    errorArco = -40;
+  } 
   float errorArco_Integral = errorAnteriorOrientacion + errorArco;
   float errorArco_Derivativo = errorAnteriorOrientacion - errorArco;
   
@@ -1092,7 +1205,7 @@ bool HacerArco(int radio, int angulo) {
   //Se verifica el estado estable tomando en cuenta un error
   if (abs(distanciaAvanzada) >= (abs(distanciaDeseada)-error_estable) && abs(distanciaAvanzada) <= (abs(distanciaDeseada)+error_estable)) { 
     n_estable += 1; //Se añade un ciclo de estabilidad
-    if (n_estable >= 20) { //Se verifica que se cumpla con 20 ciclos de estabilidad
+    if (n_estable >= 5) { //Se verifica que se cumpla con 20 ciclos de estabilidad
       sumErrorVelDer=0;
       errorAnteriorVelDer=0;
       sumErrorVelIzq=0;
@@ -1101,6 +1214,7 @@ bool HacerArco(int radio, int angulo) {
       distanciaAvanzada = 0;
       velocidadAngular = 0;
       avanceListo = true; //Movimiento terminado
+      n_estable = 0;
 
     }
     
@@ -2826,6 +2940,8 @@ void Iniciar_HSCDTD008A() {
     
 }
 
+
+
 void Medicion_HSCDTD008A(short &x, short &y, short &z) {
   segundoI2C.beginTransmission(Addr_MagFer); 
   segundoI2C.write(0x10);
@@ -2837,6 +2953,47 @@ void Medicion_HSCDTD008A(short &x, short &y, short &z) {
   y = segundoI2C.read(); y |= segundoI2C.read()<<8; 
   z = segundoI2C.read(); z |= segundoI2C.read()<<8; 
 }
+}
+
+void Iniciar_MAG3110() {
+  // Configure MAG3110
+  segundoI2C.beginTransmission(MAG3110_ADDRESS);
+  segundoI2C.write(MAG3110_REGISTER_CTRL_REG1);
+  segundoI2C.write(0b00000001); //80Hz max
+  segundoI2C.endTransmission();
+}
+
+void Leer_MAG3110(short& x, short& y, short& z) {
+  // Read data from MAG3110
+  segundoI2C.beginTransmission(MAG3110_ADDRESS);
+  segundoI2C.write(MAG3110_REGISTER_X_MSB);
+  segundoI2C.endTransmission();
+  segundoI2C.requestFrom(MAG3110_ADDRESS, 6);
+
+  // Read X, Y, and Z axis data
+  x = (segundoI2C.read() << 8) | segundoI2C.read();
+  y = (segundoI2C.read() << 8) | segundoI2C.read();
+  z = (segundoI2C.read() << 8) | segundoI2C.read();
+}
+
+float Filtrado_Z(float medida, float& anteriorH, float& anteriorL)
+{
+
+  //Aplica el primer filtro paso bajo (HIGH) (el de filtrar el ruido)
+  float FPBH = (1-alpha1)*anteriorH + (alpha1) * medida;
+
+  //Aplica el segundo filtro paso bajo (LOW) (el de filtrar las detecciones y solo dejar el valor base)
+  float FPBL = (1-alpha2)*anteriorL + (alpha2) * medida;
+  
+
+  //Resta el valor base (segundo filtro) al valor sin ruido (primer filtro)
+  float FPB = FPBH - FPBL;
+
+  //Memoria
+  anteriorH= FPBH;
+  anteriorL= FPBL;
+
+  return FPB;
 }
 
 float medirMagnetQMC(short &x, short &y, short &z) {
